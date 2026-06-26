@@ -22,7 +22,7 @@ async def analyze(request: Request):
 
     if not body.get("ticket_id"):
         return JSONResponse(status_code=400, content={"error": "Missing required field: ticket_id"})
-    if not body.get("complaint"):
+    if not str(body.get("complaint", "")).strip():
         return JSONResponse(status_code=422, content={"error": "Complaint is empty or missing"})
 
     try:

@@ -1,14 +1,11 @@
 import os
 import json
 import logging
-import google.generativeai as genai
+from dotenv import load_dotenv
 from app.models import TicketRequest
 
+load_dotenv()
 logger = logging.getLogger(__name__)
-
-# Configure the Gemini API client
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 BANNED_PHRASES = [
     "pin", "otp", "password", "passcode", "card number",
@@ -29,12 +26,23 @@ VALID_DEPTS = {
 VALID_VERDICTS = {"consistent", "inconsistent", "insufficient_data"}
 VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 
+SAFE_FALLBACK_REPLY = (
+    "Thank you for reaching out. We have received your complaint and our team is reviewing your case. "
+    "Any eligible amount will be returned through official channels after verification. "
+    "Please do not share your PIN, OTP, or password with anyone. "
+    "For assistance, contact us only through our official app or hotline."
+)
+
+
 def build_prompt(ticket: TicketRequest) -> str:
     txn_text = "No transaction history provided."
     if ticket.transaction_history:
         lines = []
         for t in ticket.transaction_history:
-            lines.append(f"- ID: {t.transaction_id} | {t.timestamp} | {t.type} | {t.amount} BDT | counterparty: {t.counterparty} | status: {t.status}")
+            lines.append(
+                f"- ID: {t.transaction_id} | {t.timestamp} | {t.type} | "
+                f"{t.amount} BDT | counterparty: {t.counterparty} | status: {t.status}"
+            )
         txn_text = "\n".join(lines)
 
     return f"""You are QueueStorm Investigator, an internal AI copilot for support agents at a digital finance platform like bKash in Bangladesh.
@@ -84,20 +92,18 @@ TRANSACTION HISTORY:
 
 Return ONLY the JSON object."""
 
+
 def get_mock_analysis(ticket: TicketRequest) -> dict:
-    """
-    A robust rule-based mock analyzer fallback if GEMINI_API_KEY is not configured
-    or if the call to Gemini fails.
-    """
+    """Rule-based mock analyzer used when GEMINI_API_KEY is not configured."""
     complaint_lower = ticket.complaint.lower()
-    
+
     evidence_verdict = "insufficient_data"
     case_type = "other"
     relevant_txn_id = None
     agent_summary = f"Customer reported: {ticket.complaint[:100]}"
-    recommended_next_action = "Investigate ticket details."
+    recommended_next_action = "Investigate ticket details manually."
     reason_codes = ["manual_review"]
-    
+
     if any(kw in complaint_lower for kw in ["wrong number", "bhul number", "wrong sent", "bhul pathay"]):
         case_type = "wrong_transfer"
         recommended_next_action = "Verify transaction with counterparty and escalate to dispute resolution team."
@@ -110,12 +116,11 @@ def get_mock_analysis(ticket: TicketRequest) -> dict:
         case_type = "duplicate_payment"
         recommended_next_action = "Compare transaction timestamps and issue refund for the second charge."
         reason_codes = ["duplicate_payment", "double_charge"]
-    elif any(kw in complaint_lower for kw in ["phish", "scam", "code", "otp", "hacked", "pin compromised"]):
+    elif any(kw in complaint_lower for kw in ["phish", "scam", "hacked", "pin compromised"]):
         case_type = "phishing_or_social_engineering"
-        recommended_next_action = "Temporarily freeze user account and escalate to fraud risk team."
+        recommended_next_action = "Temporarily freeze account and escalate to fraud risk team."
         reason_codes = ["fraud_attempt", "account_security"]
 
-    # Match transaction from history
     if ticket.transaction_history:
         for txn in ticket.transaction_history:
             if str(int(txn.amount)) in complaint_lower or txn.type in complaint_lower:
@@ -126,35 +131,38 @@ def get_mock_analysis(ticket: TicketRequest) -> dict:
             relevant_txn_id = ticket.transaction_history[0].transaction_id
             evidence_verdict = "consistent"
 
-    if case_type == "wrong_transfer":
-        customer_reply = f"We have noted your concern about transaction {relevant_txn_id or ''}. Any eligible amount will be returned through official channels after verification. Please do not share your PIN or OTP with anyone."
-    elif case_type == "phishing_or_social_engineering":
-        customer_reply = "We have received your report of suspicious activity. Your security is important to us. Any eligible amount will be returned through official channels after verification. Please do not share your PIN or OTP with anyone."
+    department_map = {
+        "wrong_transfer": "dispute_resolution",
+        "payment_failed": "payments_ops",
+        "duplicate_payment": "payments_ops",
+        "merchant_settlement_delay": "merchant_operations",
+        "agent_cash_in_issue": "agent_operations",
+        "phishing_or_social_engineering": "fraud_risk",
+        "other": "customer_support",
+    }
+    department = department_map.get(case_type, "customer_support")
+
+    severity_map = {
+        "phishing_or_social_engineering": "critical",
+        "wrong_transfer": "high",
+        "payment_failed": "medium",
+        "duplicate_payment": "medium",
+    }
+    severity = severity_map.get(case_type, "low")
+
+    if relevant_txn_id:
+        customer_reply = (
+            f"We have noted your concern regarding transaction {relevant_txn_id}. "
+            "Any eligible amount will be returned through official channels after verification. "
+            "Please do not share your PIN or OTP with anyone."
+        )
     else:
-        customer_reply = "We are reviewing your ticket. Any eligible amount will be returned through official channels after verification. Please do not share your PIN or OTP with anyone."
+        customer_reply = (
+            "We are reviewing your complaint. Any eligible amount will be returned through "
+            "official channels after verification. Please do not share your PIN or OTP with anyone."
+        )
 
-    # Compute mock routing logic
-    if case_type == "wrong_transfer":
-        department = "dispute_resolution"
-    elif case_type in ("payment_failed", "duplicate_payment"):
-        department = "payments_ops"
-    elif case_type == "merchant_settlement_delay":
-        department = "merchant_operations"
-    elif case_type == "agent_cash_in_issue":
-        department = "agent_operations"
-    elif case_type == "phishing_or_social_engineering":
-        department = "fraud_risk"
-    else:
-        department = "customer_support"
-
-    # Compute mock severity logic
-    severity = "medium"
-    if case_type == "phishing_or_social_engineering":
-        severity = "critical"
-    elif case_type == "wrong_transfer":
-        severity = "high"
-
-    result_dict = {
+    result = {
         "ticket_id": ticket.ticket_id,
         "relevant_transaction_id": relevant_txn_id,
         "evidence_verdict": evidence_verdict,
@@ -166,27 +174,36 @@ def get_mock_analysis(ticket: TicketRequest) -> dict:
         "customer_reply": customer_reply,
         "human_review_required": False,
         "confidence": 0.9,
-        "reason_codes": reason_codes
+        "reason_codes": reason_codes,
     }
-    
-    return enforce_safety(result_dict, ticket)
+    return enforce_safety(result, ticket)
+
 
 async def analyze_ticket(ticket: TicketRequest) -> dict:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or api_key.strip() == "" or api_key == "your_gemini_api_key_here":
-        logger.info("GEMINI_API_KEY not configured. Falling back to local mock analyzer.")
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key or api_key == "your_gemini_api_key_here":
+        logger.info("GEMINI_API_KEY not configured. Using local mock analyzer.")
         return get_mock_analysis(ticket)
 
     prompt = build_prompt(ticket)
-    
+
     try:
+        # Use google-genai SDK (Python 3.14 compatible, no protobuf C extensions)
+        from google import genai
         import asyncio
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+
+        client = genai.Client(api_key=api_key)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-1.5-flash",
+            contents=prompt,
+        )
         raw_text = response.text.strip()
     except Exception as e:
         logger.error(f"Gemini API call failed: {e}. Falling back to mock analyzer.")
         return get_mock_analysis(ticket)
 
+    # Strip markdown fences if present
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
         if raw_text.startswith("json"):
@@ -196,31 +213,29 @@ async def analyze_ticket(ticket: TicketRequest) -> dict:
     try:
         result = json.loads(raw_text)
     except Exception as e:
-        logger.error(f"Failed to parse Gemini JSON output: {e}. Raw text: {raw_text}")
+        logger.error(f"Failed to parse Gemini JSON: {e}. Raw: {raw_text[:200]}")
         return get_mock_analysis(ticket)
 
-    result = enforce_safety(result, ticket)
-    return result
+    return enforce_safety(result, ticket)
+
 
 def enforce_safety(result: dict, ticket: TicketRequest) -> dict:
+    """Layer 2 safety: scan customer_reply for banned phrases post-generation."""
     result["ticket_id"] = ticket.ticket_id
 
     reply_lower = result.get("customer_reply", "").lower()
     for phrase in BANNED_PHRASES:
         if phrase in reply_lower:
-            logger.warning(f"Safety violation: '{phrase}' found in customer_reply")
-            result["customer_reply"] = (
-                "Thank you for reaching out. We have received your complaint and our team is reviewing your case. "
-                "Any eligible amount will be returned through official channels after verification. "
-                "Please do not share your PIN, OTP, or password with anyone. "
-                "For assistance, contact us only through our official app or hotline."
-            )
+            logger.warning(f"Safety violation: '{phrase}' found in customer_reply — triggering fallback.")
+            result["customer_reply"] = SAFE_FALLBACK_REPLY
             result["human_review_required"] = True
             codes = result.get("reason_codes") or []
-            codes.append("safety_override")
+            if "safety_override" not in codes:
+                codes.append("safety_override")
             result["reason_codes"] = codes
             break
 
+    # Enum validation
     if result.get("evidence_verdict") not in VALID_VERDICTS:
         result["evidence_verdict"] = "insufficient_data"
     if result.get("case_type") not in VALID_CASE_TYPES:
@@ -230,7 +245,7 @@ def enforce_safety(result: dict, ticket: TicketRequest) -> dict:
     if result.get("department") not in VALID_DEPTS:
         result["department"] = "customer_support"
 
-    # Set human_review_required according to the rules
+    # Deterministic human_review_required overrides
     if result.get("severity") in {"high", "critical"}:
         result["human_review_required"] = True
     if result.get("case_type") in {"wrong_transfer", "phishing_or_social_engineering", "duplicate_payment"}:
